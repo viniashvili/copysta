@@ -1,0 +1,17 @@
+# Swift Package Manager / build output
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/
+xcuserdata/
+DerivedData/
+
+# Bundled app (recreated by `make bundle`)
+copysta.app/
+
+# macOS
+.DS_Store
+
+# Claude Code
+.claude/
+CLAUDE.md
