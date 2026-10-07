@@ -163,13 +163,15 @@ final class PopupPanel: NSPanel {
     }
 }
 
-/// Frosted glass with full-strength blur but a thinner milky tint.
+/// Frosted glass with a lighter blur and a thinner milky tint, so text behind stays faintly visible.
 /// NSVisualEffectView stacks a `backdrop` layer (the blur) under a `fill` layer (~48 % white);
 /// fading only `fill` makes the panel more see-through without letting the unblurred
 /// background bleed in. If AppKit ever renames these layers, this silently does nothing.
 final class ClearBlurView: NSVisualEffectView {
     /// Opacity of the white tint over the blur: 1 = stock look, 0 = pure blur.
     var tintOpacity: Float = 0.35
+    /// Gaussian blur radius of what's behind (stock is 30, which smears small text away).
+    var blurRadius: CGFloat = 12
 
     // AppKit (re)builds the material sublayers when it updates the view's layer,
     // so re-apply after every update rather than only on layout.
@@ -195,8 +197,15 @@ final class ClearBlurView: NSVisualEffectView {
 
     private func thinTint() {
         for material in layer?.sublayers ?? [] {
-            for sub in material.sublayers ?? [] where sub.name == "fill" {
-                sub.opacity = tintOpacity
+            for sub in material.sublayers ?? [] {
+                switch sub.name {
+                case "fill":
+                    sub.opacity = tintOpacity
+                case "backdrop":
+                    sub.setValue(blurRadius, forKeyPath: "filters.gaussianBlur.inputRadius")
+                default:
+                    break
+                }
             }
         }
     }
