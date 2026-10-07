@@ -81,8 +81,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         hotkey = HotkeyManager()
         hotkey.register { [weak self] in
             guard let self else { return }
-            if self.panel.isVisible {
-                self.panel.orderOut(nil)
+            if self.panel.isVisible && !self.panel.isClosing {
+                self.panel.dismiss()
             } else {
                 self.showPanelNearCaret()
             }

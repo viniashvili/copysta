@@ -4,6 +4,8 @@ import SwiftUI
 // Shared state between PopupPanel (key events) and HistoryView (rendering).
 final class PopupKeyState: ObservableObject {
     @Published var selectedIndex: Int = 0
+    /// True for a split second while the chosen row blinks before pasting.
+    @Published var isFlashing = false
 }
 
 final class PopupPanel: NSPanel {
@@ -13,16 +15,34 @@ final class PopupPanel: NSPanel {
     /// Distance from the popup's left edge to row text (list padding + row padding),
     /// so the text lines up under the caret.
     static let textInset: CGFloat = 16
+    /// Transparent margin around the card where its drop shadow is drawn. The shadow lives
+    /// on the card's layer (not the window) so it scales with the open/close animation.
+    static let shadowMargin: CGFloat = 32
 
     private let service: HistoryService
     private let watcher: ClipboardWatcher
     private let keyState = PopupKeyState()
+    /// The visible popup (rounded, blurred, with shadow) inside the slightly larger window.
+    private let card = NSView(frame: NSRect(origin: NSPoint(x: shadowMargin, y: shadowMargin), size: size))
+    /// Bumped on every show, so a fade-out that finishes after a re-show doesn't hide the panel.
+    private var showGeneration = 0
+    private(set) var isClosing = false
+
+    private static let openDuration: CFTimeInterval = 0.24
+    private static let closeDuration: CFTimeInterval = 0.16
+    /// Scale the popup grows from / shrinks to — effectively a dot at the caret.
+    private static let collapsedScale: CGFloat = 0.04
+    /// Where the caret sits in the card's own coordinates; the grow/shrink anchor.
+    private var caretAnchor = CGPoint.zero
+
+    private var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
     init(service: HistoryService, watcher: ClipboardWatcher) {
         self.service = service
         self.watcher = watcher
         super.init(
-            contentRect: NSRect(origin: .zero, size: Self.size),
+            contentRect: NSRect(origin: .zero, size: NSSize(width: Self.size.width + 2 * Self.shadowMargin,
+                                                            height: Self.size.height + 2 * Self.shadowMargin)),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -30,7 +50,7 @@ final class PopupPanel: NSPanel {
         level = .floating
         isOpaque = false
         backgroundColor = .clear
-        hasShadow = true
+        hasShadow = false
         isMovableByWindowBackground = true
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         buildContentView()
@@ -55,7 +75,7 @@ final class PopupPanel: NSPanel {
             let idx = min(keyState.selectedIndex, entries.count - 1)
             copyAndPaste(entries[idx])
         case 53: // Escape
-            orderOut(nil)
+            dismiss()
         default:
             super.keyDown(with: event)
         }
@@ -65,11 +85,12 @@ final class PopupPanel: NSPanel {
 
     func showNear(_ point: NSPoint) {
         keyState.selectedIndex = 0
+        keyState.isFlashing = false
 
         let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) })
                      ?? NSScreen.main!
         let visible = screen.visibleFrame
-        let sz = frame.size
+        let sz = Self.size
 
         // point.y is the caret BOTTOM edge (AppKit, Y up).
         // Preferred: popup directly below the caret, row text aligned with the caret x.
@@ -88,12 +109,113 @@ final class PopupPanel: NSPanel {
         if origin.x + sz.width > visible.maxX { origin.x = visible.maxX - sz.width }
         if origin.x < visible.minX { origin.x = visible.minX }
 
-        setFrameOrigin(origin)
+        // The caret relative to the popup — the point it grows out of.
+        caretAnchor = CGPoint(x: point.x - origin.x, y: point.y - origin.y)
+        animateIn(to: origin)
+    }
+
+    // MARK: - Animations
+
+    /// Grow out of the caret: the content starts as a dot at `caretAnchor` and scales up.
+    private func animateIn(to origin: NSPoint) {
+        showGeneration += 1
+        isClosing = false
+
+        setFrameOrigin(NSPoint(x: origin.x - Self.shadowMargin, y: origin.y - Self.shadowMargin))
+        alphaValue = 1
+        guard let layer = card.layer, !reduceMotion else {
+            fadeWindow(from: 0, to: 1, duration: Self.openDuration)
+            makeKeyAndOrderFront(nil)
+            return
+        }
+
+        layer.removeAllAnimations()
+        layer.transform = CATransform3DIdentity
         makeKeyAndOrderFront(nil)
+
+        CATransaction.begin()
+        let grow = CABasicAnimation(keyPath: "transform")
+        grow.fromValue = collapsedTransform()
+        grow.toValue = CATransform3DIdentity
+        grow.duration = Self.openDuration
+        // Fast start, soft landing with a hint of overshoot.
+        grow.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1.04)
+        layer.add(grow, forKey: "grow")
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0
+        fade.toValue = 1
+        fade.duration = Self.openDuration * 0.5
+        layer.add(fade, forKey: "fadeIn")
+        CATransaction.commit()
+    }
+
+    /// Shrink back into the caret (the reverse of opening), then remove the panel.
+    func dismiss(completion: (() -> Void)? = nil) {
+        guard isVisible, !isClosing else {
+            completion?()
+            return
+        }
+        isClosing = true
+        let generation = showGeneration
+        let finish = { [weak self] in
+            guard let self, generation == self.showGeneration else { return }
+            self.orderOut(nil)
+            self.card.layer?.removeAllAnimations()
+            self.card.layer?.transform = CATransform3DIdentity
+            self.card.layer?.opacity = 1
+            self.alphaValue = 1
+            self.isClosing = false
+            completion?()
+        }
+
+        guard let layer = card.layer, !reduceMotion else {
+            fadeWindow(from: 1, to: 0, duration: Self.closeDuration, completion: finish)
+            return
+        }
+
+        CATransaction.begin()
+        CATransaction.setCompletionBlock(finish)
+        let shrink = CABasicAnimation(keyPath: "transform")
+        shrink.fromValue = CATransform3DIdentity
+        shrink.toValue = collapsedTransform()
+        shrink.duration = Self.closeDuration
+        shrink.timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0, 0.9, 0.6)
+        shrink.fillMode = .forwards
+        shrink.isRemovedOnCompletion = false
+        layer.add(shrink, forKey: "shrink")
+
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        fade.beginTime = CACurrentMediaTime() + Self.closeDuration * 0.4
+        fade.duration = Self.closeDuration * 0.6
+        fade.fillMode = .forwards
+        fade.isRemovedOnCompletion = false
+        layer.add(fade, forKey: "fadeOut")
+        CATransaction.commit()
+    }
+
+    /// Scale about the caret anchor: translate the anchor to the origin, scale, move back.
+    /// (A view's backing layer has its anchorPoint at the bottom-left, so we can't just
+    /// change anchorPoint — AppKit owns that.)
+    private func collapsedTransform() -> CATransform3D {
+        let a = caretAnchor
+        var t = CATransform3DMakeTranslation(a.x, a.y, 0)
+        t = CATransform3DScale(t, Self.collapsedScale, Self.collapsedScale, 1)
+        return CATransform3DTranslate(t, -a.x, -a.y, 0)
+    }
+
+    private func fadeWindow(from: CGFloat, to: CGFloat, duration: CFTimeInterval,
+                            completion: (() -> Void)? = nil) {
+        alphaValue = from
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            animator().alphaValue = to
+        }, completionHandler: completion)
     }
 
     // MARK: - Private
-
 
     private func buildContentView() {
         let bounds = NSRect(origin: .zero, size: Self.size)
@@ -121,7 +243,20 @@ final class PopupPanel: NSPanel {
         hosting.frame = bounds
         hosting.autoresizingMask = [.width, .height]
         container.addSubview(hosting)
-        contentView = container
+        // Card = shadow + clipped container. The shadow can't sit on `container` itself
+        // because masksToBounds would clip it away.
+        card.wantsLayer = true
+        card.layer?.shadowColor = NSColor.black.cgColor
+        card.layer?.shadowOpacity = 0.22
+        card.layer?.shadowRadius = 16
+        card.layer?.shadowOffset = CGSize(width: 0, height: -6)
+        card.layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: 14, cornerHeight: 14, transform: nil)
+        card.addSubview(container)
+
+        let root = ShadowMarginView(frame: NSRect(origin: .zero, size: frame.size))
+        root.onClickOutsideCard = { [weak self] in self?.dismiss() }
+        root.addSubview(card)
+        contentView = root
     }
 
     private func setupDismiss() {
@@ -129,7 +264,7 @@ final class PopupPanel: NSPanel {
             forName: NSWindow.didResignKeyNotification,
             object: self,
             queue: .main
-        ) { [weak self] _ in self?.orderOut(nil) }
+        ) { [weak self] _ in self?.dismiss() }
     }
 
     private func copyAndPaste(_ entry: Entry) {
@@ -147,19 +282,35 @@ final class PopupPanel: NSPanel {
             }
         }
 
-        // Hide the panel so the previously focused window regains key status.
-        orderOut(nil)
-
-        // Simulate ⌘V into the frontmost app after a brief yield.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            guard let src = CGEventSource(stateID: .hidSystemState) else { return }
-            let kd = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
-            let ku = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
-            kd?.flags = .maskCommand
-            ku?.flags = .maskCommand
-            kd?.post(tap: .cgSessionEventTap)
-            ku?.post(tap: .cgSessionEventTap)
+        // Blink the chosen row like a macOS menu item, fade the panel out, then paste
+        // into the previously focused app (which regains key status once we're gone).
+        keyState.isFlashing = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) { [weak self] in
+            self?.keyState.isFlashing = false
+            self?.dismiss {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { Self.postPaste() }
+            }
         }
+    }
+
+    private static func postPaste() {
+        guard let src = CGEventSource(stateID: .hidSystemState) else { return }
+        let kd = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: true)
+        let ku = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
+        kd?.flags = .maskCommand
+        ku?.flags = .maskCommand
+        kd?.post(tap: .cgSessionEventTap)
+        ku?.post(tap: .cgSessionEventTap)
+    }
+}
+
+/// The window's root view. Its margin only holds the card's shadow, so a click there
+/// counts as a click outside the popup.
+private final class ShadowMarginView: NSView {
+    var onClickOutsideCard: (() -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        onClickOutsideCard?()
     }
 }
 

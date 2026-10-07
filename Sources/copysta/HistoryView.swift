@@ -6,6 +6,9 @@ struct HistoryView: View {
     @ObservedObject var keyState: PopupKeyState
     let onSelect: (Entry) -> Void
 
+    @Namespace private var selection
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         Group {
             if service.entries.isEmpty {
@@ -18,6 +21,7 @@ struct HistoryView: View {
             }
         }
         .background(.clear)
+        .animation(.easeInOut(duration: 0.2), value: service.entries.isEmpty)
     }
 
     // ScrollView + LazyVStack instead of List so that arrow-key events are NOT
@@ -30,18 +34,35 @@ struct HistoryView: View {
                         EntryRow(
                             entry: entry,
                             isSelected: idx == keyState.selectedIndex,
+                            isFlashing: keyState.isFlashing,
+                            selection: selection,
                             onSelect: { onSelect(entry) },
                             onHover: { keyState.selectedIndex = idx },
                             onDelete: { service.delete(entry) }
                         )
                         .id(entry.id)
+                        // Removed rows fade and shrink while the rows below slide up.
+                        .transition(reduceMotion
+                                    ? .opacity
+                                    : .asymmetric(insertion: .opacity,
+                                                  removal: .opacity.combined(with: .scale(scale: 0.95))))
                     }
                 }
                 .padding(6)
+                .animation(.easeInOut(duration: 0.22), value: service.entries.map(\.id))
+                // The highlight glides between rows instead of jumping.
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: keyState.selectedIndex)
+                .animation(.easeInOut(duration: 0.07), value: keyState.isFlashing)
             }
             .onChange(of: keyState.selectedIndex, perform: { idx in
                 guard idx < service.entries.count else { return }
                 proxy.scrollTo(service.entries[idx].id)
+            })
+            // Deleting the last row would leave the selection pointing past the end.
+            .onChange(of: service.entries.count, perform: { count in
+                if keyState.selectedIndex >= count {
+                    keyState.selectedIndex = max(0, count - 1)
+                }
             })
         }
     }
@@ -52,6 +73,8 @@ struct HistoryView: View {
 private struct EntryRow: View {
     let entry: Entry
     let isSelected: Bool
+    let isFlashing: Bool
+    let selection: Namespace.ID
     let onSelect: () -> Void
     let onHover: () -> Void
     let onDelete: () -> Void
@@ -86,10 +109,14 @@ private struct EntryRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color(red: 0.04, green: 0.39, blue: 0.84) : Color.clear)
-        )
+        .background {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color(red: 0.04, green: 0.39, blue: 0.84))
+                    .opacity(isFlashing ? 0.35 : 1)
+                    .matchedGeometryEffect(id: "selection", in: selection)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .onHover { if $0 { onHover() } }
